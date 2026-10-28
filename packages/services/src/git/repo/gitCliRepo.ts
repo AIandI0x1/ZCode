@@ -139,6 +139,47 @@ function addAutoRefreshWatchPath(
   });
 }
 
+/**
+ * Git 元数据目录中体量很小、必须递归监视的引用类子目录。
+ *
+ * `objects/`、`lfs/`、`modules/` 故意不在此列：它们只增不减且数量巨大。
+ */
+export const GIT_METADATA_RECURSIVE_WATCH_SUBDIRS = [
+  "refs",
+  "logs",
+  "reftable",
+  "worktrees",
+] as const;
+
+/**
+ * 展开一个 Git 元数据目录的监视边界。
+ *
+ * 关键约束（Linux）：`fs.watch(dir, { recursive: true })` 会为目录树里的
+ * **每个文件和目录**各注册一个 inotify watch，注册成本是 O(条目数)。
+ * `.git/objects` 的松散对象可达 10^5 量级——实测一个 461 GB 仓库有
+ * 568k loose objects，递归监视 `.git` 一次性注册约 57 万个 watch、耗时约 24 秒，
+ * 这段时间阻塞 Host 事件循环，把 renderer 的
+ * `session/requestRuntimePreferences` 拖过 15 秒客户端超时，
+ * 直接导致用户回合失败（"Client request timed out"），应用看似不可用。
+ *
+ * 因此 gitDir 本身只做**非递归**监视：HEAD / index / packed-refs /
+ * COMMIT_EDITMSG / FETCH_HEAD / MERGE_HEAD 等状态文件都是它的直接子项，
+ * 任何 Git 状态变化都会落到这些子项上。只有目录数很小的引用类子目录才递归。
+ */
+export function buildGitMetadataWatchPaths(
+  gitDir: string,
+): GitResolvedRepository["autoRefreshWatchPaths"] {
+  const paths: GitResolvedRepository["autoRefreshWatchPaths"] = [];
+
+  addAutoRefreshWatchPath(paths, gitDir, false);
+  for (const subdirectory of GIT_METADATA_RECURSIVE_WATCH_SUBDIRS) {
+    addAutoRefreshWatchPath(paths, join(gitDir, subdirectory), true);
+  }
+
+  return paths;
+}
+
+
 function buildAutoRefreshWatchPaths(params: {
   workspacePath: string;
   absoluteGitDir: string;
@@ -151,7 +192,6 @@ function buildAutoRefreshWatchPaths(params: {
 
   // Git 元数据可能在 linked worktree 或 separate git-dir 中位于 repoRoot 之外。
   // UI 只知道工作区路径，不能猜 `.git` 布局；这里用 Git 自身解析出的目录作为刷新边界。
-  addAutoRefreshWatchPath(paths, params.absoluteGitDir, true);
   const resolvedCommonDir = params.gitCommonDir
     ? isAbsolute(params.gitCommonDir)
       ? params.gitCommonDir
@@ -159,7 +199,13 @@ function buildAutoRefreshWatchPaths(params: {
         // 子目录 workspace 若误用 repoRoot 会把 `/root` + `../.git` 解析成 `/.git`。
         resolve(params.workspacePath, params.gitCommonDir)
     : params.absoluteGitDir;
-  addAutoRefreshWatchPath(paths, resolvedCommonDir, true);
+
+  // 只展开浅边界，绝不递归整个 gitDir（原因见 buildGitMetadataWatchPaths 注释）。
+  for (const gitDir of new Set([params.absoluteGitDir, resolvedCommonDir])) {
+    for (const watchPath of buildGitMetadataWatchPaths(gitDir)) {
+      addAutoRefreshWatchPath(paths, watchPath.path, watchPath.recursive);
+    }
+  }
 
   return paths;
 }

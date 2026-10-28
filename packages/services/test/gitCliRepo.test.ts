@@ -9,7 +9,7 @@ import type {
   GitCommandProvider,
 } from "../src/git/providers/gitCommandProvider.js";
 import { createGitService } from "../src/git/gitService.js";
-import { createGitCliRepo } from "../src/git/repo/gitCliRepo.js";
+import { buildGitMetadataWatchPaths, createGitCliRepo } from "../src/git/repo/gitCliRepo.js";
 
 const tempDirs: string[] = [];
 
@@ -470,3 +470,38 @@ describe("gitCliRepo", () => {
     });
   });
 });
+
+describe("buildGitMetadataWatchPaths", () => {
+  it("never watches the git directory recursively", () => {
+    const paths = buildGitMetadataWatchPaths("/repo/.git");
+
+    // 回归保护：Linux 的递归 fs.watch 会为每个文件/目录注册一个 inotify watch，
+    // 递归整个 .git 在松散对象多的仓库会让 Host 阻塞 20 秒以上（见函数注释）。
+    expect(paths.find((entry) => entry.path === "/repo/.git")).toEqual({
+      path: "/repo/.git",
+      recursive: false,
+    });
+
+    expect(
+      paths
+        .filter((entry) => entry.recursive)
+        .map((entry) => entry.path)
+        .sort(),
+    ).toEqual([
+      "/repo/.git/logs",
+      "/repo/.git/refs",
+      "/repo/.git/reftable",
+      "/repo/.git/worktrees",
+    ]);
+  });
+
+  it("keeps object and lfs storage out of the watch set", () => {
+    const recursivePaths = buildGitMetadataWatchPaths("/repo/.git")
+      .filter((entry) => entry.recursive)
+      .map((entry) => entry.path);
+
+    expect(recursivePaths.some((path) => path.includes("/objects"))).toBe(false);
+    expect(recursivePaths.some((path) => path.includes("/lfs"))).toBe(false);
+  });
+});
+
